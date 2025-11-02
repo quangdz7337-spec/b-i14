@@ -1,1 +1,152 @@
+#include "stm32f10x.h"
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_gpio.h"
+#include "stm32f10x_exti.h"
+#include "stm32f10x_usart.h"
 
+#ifndef USE_WFI
+#define USE_WFI 1   // 1: WFI, 0: WFE
+#endif
+#define USE_EXTI_WAKE 1           // 1: c?u hình PA0/EXTI0 làm ngu?n dánh th?c
+#define UART_BAUD 9600U           // Ð?t baudrate 9600
+
+static volatile uint8_t g_woke_by_exti0 = 0;
+
+/* ===== Tiny delay (~1ms @72MHz, ch? d? demo) ===== */
+static void tiny_delay_ms(uint32_t ms){
+  for(uint32_t i=0;i<ms;i++) for(volatile uint32_t j=0;j<8000;j++) __NOP();
+}
+
+/* ===== UART (USART1) — Polling TX ===== */
+static void USART1_Init_Polling(uint32_t baud){
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_USART1 | RCC_APB2Periph_AFIO, ENABLE);
+
+  GPIO_InitTypeDef io; GPIO_StructInit(&io);
+  // PA9 = TX (AF Push-Pull)
+  io.GPIO_Pin   = GPIO_Pin_9;
+  io.GPIO_Speed = GPIO_Speed_50MHz;
+  io.GPIO_Mode  = GPIO_Mode_AF_PP;
+  GPIO_Init(GPIOA, &io);
+  // PA10 = RX (input floating)
+  io.GPIO_Pin   = GPIO_Pin_10;
+  io.GPIO_Mode  = GPIO_Mode_IN_FLOATING;
+  GPIO_Init(GPIOA, &io);
+
+  USART_InitTypeDef u;
+  USART_StructInit(&u);
+  u.USART_BaudRate = baud;
+  u.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+  USART_Init(USART1, &u);
+  USART_Cmd(USART1, ENABLE);
+}
+
+static void UART_SendChar(char c){
+  if (c=='\n'){
+    while(!(USART1->SR & USART_SR_TXE));
+    USART1->DR = (uint16_t)'\r';
+  }
+  while(!(USART1->SR & USART_SR_TXE));
+  USART1->DR = (uint16_t)c;
+}
+static void UART_SendString(const char* s){ while(*s) UART_SendChar(*s++); }
+static void UART_SendUInt(uint32_t v){
+  char buf[16]; int i=0; if(!v){ UART_SendChar('0'); return; }
+  char tmp[16]; int j=0; while(v && j<(int)sizeof(tmp)){ tmp[j++]='0'+(v%10); v/=10; }
+  while(j) buf[i++]=tmp[--j]; for(int k=0;k<i;k++) UART_SendChar(buf[k]);
+}
+
+#if USE_EXTI_WAKE
+/* ===== EXTI wake on PA0 (falling edge) ===== */
+static void Wake_PA0_EXTI_Falling_Init(void){
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
+
+  GPIO_InitTypeDef io; GPIO_StructInit(&io);
+  io.GPIO_Pin  = GPIO_Pin_0;
+  io.GPIO_Mode = GPIO_Mode_IPU;      // pull-up trong; nh?n -> GND
+  GPIO_Init(GPIOA, &io);
+
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOA, GPIO_PinSource0);
+
+  EXTI_InitTypeDef ex; EXTI_StructInit(&ex);
+  ex.EXTI_Line = EXTI_Line0;
+  ex.EXTI_Mode = EXTI_Mode_Interrupt;
+  ex.EXTI_Trigger = EXTI_Trigger_Falling;
+  ex.EXTI_LineCmd = ENABLE;
+  EXTI_Init(&ex);
+
+  EXTI_ClearITPendingBit(EXTI_Line0);
+
+  NVIC_InitTypeDef nv = {0};
+  nv.NVIC_IRQChannel = EXTI0_IRQn;
+  nv.NVIC_IRQChannelPreemptionPriority = 2;
+  nv.NVIC_IRQChannelSubPriority = 0;
+  nv.NVIC_IRQChannelCmd = ENABLE;
+  NVIC_Init(&nv);
+}
+void EXTI0_IRQHandler(void){
+  if (EXTI_GetITStatus(EXTI_Line0)!=RESET){
+    EXTI_ClearITPendingBit(EXTI_Line0);
+    g_woke_by_exti0 = 1;        // dánh d?u dã du?c dánh th?c b?i PA0
+  }
+}
+#endif
+
+int main(void){
+  /* UART banner */
+  USART1_Init_Polling(UART_BAUD);
+	UART_SendString("\n\n--- Sleep demo (WFI/WFE) + UART ---\n");
+  UART_SendString("USART1 @ "); UART_SendUInt(UART_BAUD); UART_SendString(" bps\n");
+  UART_SendString("Mode: "); UART_SendString(USE_WFI ? "WFI" : "WFE"); UART_SendString("\n");
+  UART_SendString("EXTI wake: "); UART_SendString(USE_EXTI_WAKE ? "EN" : "DIS"); UART_SendString("\n");
+
+  /* 1) LED PB12 output */
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+  GPIO_InitTypeDef io; GPIO_StructInit(&io);
+  io.GPIO_Pin   = GPIO_Pin_12;
+  io.GPIO_Speed = GPIO_Speed_2MHz;
+  io.GPIO_Mode  = GPIO_Mode_Out_PP;
+  GPIO_Init(GPIOB, &io);
+
+  /* 2) Blink 5 times */
+  UART_SendString("Blinking PB12 x5 ...\n");
+  for(int i=0;i<5;i++){
+    GPIO_SetBits(GPIOB, GPIO_Pin_12);   // ON (tùy cách d?u LED)
+    tiny_delay_ms(300);
+    GPIO_ResetBits(GPIOB, GPIO_Pin_12); // OFF
+    tiny_delay_ms(300);
+  }
+
+  /* 3) T?t LED, gi?i phóng & t?t clock GPIOB d? ti?t ki?m */
+  GPIO_ResetBits(GPIOB, GPIO_Pin_12);
+  GPIO_DeInit(GPIOB);
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, DISABLE);
+
+  /* 4) Chu?n b? Sleep (không deep-sleep) */
+  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
+
+#if USE_EXTI_WAKE
+  Wake_PA0_EXTI_Falling_Init();
+  UART_SendString("Wake source: EXTI0 (PA0, falling). Press button to wake.\n");
+#else
+  UART_SendString("No wake source configured. MCU will sleep indefinitely.\n");
+#endif
+
+#if USE_WFI
+  UART_SendString("Entering Sleep via WFI...\n");
+  __WFI();                              // ch? INTERRUPT
+#else
+  UART_SendString("Entering Sleep via WFE...\n");
+  SCB->SCR |= SCB_SCR_SEVONPEND_Msk;    // pending IRQ cung t?o EVENT (giúp WFE th?c d?y)
+  __SEV(); __WFE(); __WFE();            // kh? event t?n d?ng, r?i ng? ch? EVENT m?i
+#endif
+
+  /* 6) Ch?y ti?p sau khi du?c dánh th?c (n?u có) */
+  if (g_woke_by_exti0){
+    UART_SendString("Woke up by EXTI0 (PA0)\n");
+  } else {
+    UART_SendString("Woke up (source not flagged)\n");
+  }
+
+  UART_SendString("Idle loop...\n");
+  while(1){ __NOP(); }
+}
