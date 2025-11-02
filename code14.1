@@ -1,1 +1,275 @@
+#include "stm32f10x.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "event_groups.h" 
 
+
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_gpio.h"
+#include "stm32f10x_usart.h"
+
+
+#define EV_BTN_PRESS      ( 1 << 0 )
+#define EV_FREQ_2HZ       ( 1 << 1 )
+#define EV_FREQ_10HZ      ( 1 << 2 )
+#define EV_FREQ_50HZ      ( 1 << 3 )
+#define EV_UART_SEND      ( 1 << 4 )
+#define EV_FREQ_MASK      ( EV_FREQ_2HZ | EV_FREQ_10HZ | EV_FREQ_50HZ )
+
+
+#define LED_BLINK_PORT      GPIOB
+#define LED_BLINK_PIN       GPIO_Pin_9  
+
+
+EventGroupHandle_t g_xTaskEventGroup;
+static volatile uint8_t g_currentFreqHz = 2; 
+
+
+static void prvUSART2_Config(void);
+static void prvGPIO_Config(void);
+
+
+static void USART2_SendChar(char c);
+static void USART2_SendString(const char *str);
+
+
+static void vTask_Button(void *pvParameters);
+static void vTask_Main(void *pvParameters);
+static void vTask_Blink(void *pvParameters);
+static void vTask_UART(void *pvParameters);
+
+
+int main(void)
+{
+    
+    prvGPIO_Config();
+    
+   
+    prvUSART2_Config(); 
+    
+    USART2_SendString("--- He thong da chuyen LED BLINK sang PB9 va dung USART2 ---\r\n");
+    USART2_SendString("Nhan nut PA0 de bat dau...\r\n");
+
+    
+    g_xTaskEventGroup = xEventGroupCreate();
+
+    if(g_xTaskEventGroup != NULL)
+    {
+        
+        xTaskCreate(vTask_Main, "Task Main", 256, NULL, tskIDLE_PRIORITY + 3, NULL);
+        xTaskCreate(vTask_Button, "Task Button", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
+        xTaskCreate(vTask_UART, "Task UART", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
+        xTaskCreate(vTask_Blink, "Task Blink", 256, NULL, tskIDLE_PRIORITY + 1, NULL);
+
+       
+        vTaskStartScheduler();
+    }
+
+    while(1) {}
+}
+
+
+
+
+void vTask_Main(void *pvParameters)
+{
+    (void)pvParameters;
+    EventBits_t uxBitsToSet = 0;
+    
+    while(1)
+    {
+        xEventGroupWaitBits(
+            g_xTaskEventGroup,
+            EV_BTN_PRESS,
+            pdTRUE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+        
+        
+        if(g_currentFreqHz == 2)
+        {
+            g_currentFreqHz = 10;
+            uxBitsToSet = EV_FREQ_10HZ;
+        }
+        else if(g_currentFreqHz == 10)
+        {
+            g_currentFreqHz = 50;
+            uxBitsToSet = EV_FREQ_50HZ;
+        }
+        else 
+        {
+            g_currentFreqHz = 2;
+            uxBitsToSet = EV_FREQ_2HZ;
+        }
+        
+        uxBitsToSet |= EV_UART_SEND;
+        
+        xEventGroupSetBits(g_xTaskEventGroup, uxBitsToSet);
+    }
+}
+
+
+static void vTask_Button(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    while(1)
+    {
+        
+        if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET)
+        {
+            vTaskDelay(pdMS_TO_TICKS(20)); 
+            
+            
+            if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET)
+            {
+                
+                while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                xEventGroupSetBits(g_xTaskEventGroup, EV_BTN_PRESS);
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+
+static void vTask_Blink(void *pvParameters)
+{
+    (void)pvParameters;
+    TickType_t t_half_ticks = pdMS_TO_TICKS(250); 
+    EventBits_t uxBits;
+    
+    while(1)
+    {
+        
+        uxBits = xEventGroupWaitBits(
+            g_xTaskEventGroup,
+            EV_FREQ_MASK,
+            pdTRUE,
+            pdFALSE,
+            t_half_ticks
+        );
+        
+        
+        if((uxBits & EV_FREQ_MASK) != 0)
+        {
+            if(uxBits & EV_FREQ_2HZ) t_half_ticks = pdMS_TO_TICKS(250); 
+            else if(uxBits & EV_FREQ_10HZ) t_half_ticks = pdMS_TO_TICKS(50); 
+            else if(uxBits & EV_FREQ_50HZ) t_half_ticks = pdMS_TO_TICKS(10); 
+            
+           
+            GPIO_SetBits(LED_BLINK_PORT, LED_BLINK_PIN); 
+        }
+        else
+        {
+           
+            LED_BLINK_PORT->ODR ^= LED_BLINK_PIN;
+        }
+    }
+}
+
+
+static void vTask_UART(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    while(1)
+    {
+       
+        xEventGroupWaitBits(
+            g_xTaskEventGroup,
+            EV_UART_SEND,
+            pdTRUE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+        
+       
+        USART2_SendString("-> UART: ");
+        if(g_currentFreqHz == 2)
+        {
+            USART2_SendString("Doi tan so sang 2 Hz (0.5s ON/OFF)\r\n");
+        }
+        else if(g_currentFreqHz == 10)
+        {
+            USART2_SendString("Doi tan so sang 10 Hz (50ms ON/OFF)\r\n");
+        }
+        else if(g_currentFreqHz == 50)
+        {
+            USART2_SendString("Doi tan so sang 50 Hz (10ms ON/OFF)\r\n");
+        }
+    }
+}
+
+
+static void prvUSART2_Config(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct;
+    USART_InitTypeDef USART_InitStruct;
+
+    
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE); 
+
+  
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin_2;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF_PP; 
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+   
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  
+    USART_InitStruct.USART_BaudRate = 115200;
+    USART_InitStruct.USART_WordLength = USART_WordLength_8b;
+    USART_InitStruct.USART_StopBits = USART_StopBits_1;
+    USART_InitStruct.USART_Parity = USART_Parity_No;
+    USART_InitStruct.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_InitStruct.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+    
+    USART_Init(USART2, &USART_InitStruct);
+    USART_Cmd(USART2, ENABLE);
+}
+
+static void prvGPIO_Config(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct;
+
+   
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+
+    
+    GPIO_InitStruct.GPIO_Pin = LED_BLINK_PIN;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(LED_BLINK_PORT, &GPIO_InitStruct);
+   
+    GPIO_ResetBits(LED_BLINK_PORT, LED_BLINK_PIN);
+
+  
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin_0;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IPU; 
+    GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+static void USART2_SendChar(char c)
+{
+    while(USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+    USART_SendData(USART2, c);
+}
+
+static void USART2_SendString(const char *str)
+{
+    while(*str)
+    {
+        USART2_SendChar(*str++);
+    }
+}
